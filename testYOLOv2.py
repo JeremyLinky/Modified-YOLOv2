@@ -1,4 +1,5 @@
 import os
+import gc
 import random
 import utils.tfrecord_voc_utils as voc_utils
 import tensorflow as tf
@@ -9,19 +10,19 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 lr = 0.0005
 batch_size = 16
-buffer_size = 1200
+buffer_size = 800
 epochs = 1000
 data = os.listdir('./data/')
 data = [os.path.join('./data/', name) for name in data]
 
 shape = [320, 352, 384, 416, 448, 480, 512, 544, 576, 608]
-input_shape = [608, 608, 3]
-factor = float(input_shape[0]/608)
-path_backone = './yolo2/test-backone-4524'
-path_head = './yolo2/test-head-4524'
+input_shape = [320, 320, 3]
+factor = float(input_shape[0]/320)
+path_backone = './yolo2/test-backone-1560'
+path_head = './yolo2/test-head-1560'
 config = {
     'mode': 'train',                                 # 'train', 'test'
-    'is_pretraining': False,
+    'is_pretraining': True,
     'data_shape': input_shape,
     'num_classes': 20,
     'weight_decay': 5e-4,
@@ -49,17 +50,18 @@ image_augmentor_config = {
     'data_format': 'channels_last',
     'output_shape': [input_shape[0], input_shape[1]],
     # 'zoom_size': [520, 520],
-    'crop_method': 'random',
-    'flip_prob': [0., 0.5],
+    # 'crop_method': 'random',
+    # 'flip_prob': [0., 0.5],
     'fill_mode': 'BILINEAR',
     'keep_aspect_ratios': False,
     'constant_values': 0.,
-    'color_jitter_prob': 0.5,
-    'rotate': [0.5, -10., 10.],
+    # 'color_jitter_prob': 0.5,
+    # 'rotate': [0.5, -10., 10.],
     'pad_truth_to': 60,
 }
 
-train_gen = voc_utils.get_generator(data, batch_size, buffer_size, image_augmentor_config)
+dataset = voc_utils.Dataset()
+train_gen = dataset.get_generator(data, batch_size, buffer_size, image_augmentor_config)
 
 train_provider = {
     'data_shape': input_shape,
@@ -71,12 +73,11 @@ train_provider = {
 
 testnet = yolov2.YOLOv2(config, train_provider)
 for i in range(epochs):
-    if i % 10 == 0 and i != 0:
+    if i % 1 == 0 and i != 0:
         index = random.randint(0, 9)
-        input_shape = [shape[index], shape[index], 3]
+        input_shape = [shape[0], shape[0], 3]
         factor = float(input_shape[0] / 320)
         testnet.data_shape = input_shape
-        print('Resize:  ' + str(input_shape))
         priors = [[round(0.42*factor, 3), round(0.72*factor, 3)],
                   [round(0.92*factor, 3), round(1.63*factor, 3)],
                   [round(1.78*factor, 3), round(3.2*factor, 3)],
@@ -85,12 +86,15 @@ for i in range(epochs):
         priors = tf.convert_to_tensor(priors, dtype=tf.float32)
         testnet.priors = tf.reshape(priors, [1, 1, testnet.num_priors, 2])
         image_augmentor_config['output_shape'] = [input_shape[0], input_shape[1]]
-        train_gen = voc_utils.get_generator(data, batch_size, buffer_size, image_augmentor_config)
-        testnet.train_generator = train_gen
-        testnet.train_initializer, testnet.train_iterator = testnet.train_generator
+        del dataset, train_gen, testnet.train_initializer, testnet.train_iterator, testnet.train_generator
+        gc.collect()
+        dataset = voc_utils.Dataset()
+        train_gen = dataset.get_generator(data, batch_size, buffer_size, image_augmentor_config)
+        testnet.change_iterator(train_gen)
         testnet.define_inputs()
-        
+
     print('-'*25, 'epoch', i, '-'*25)
+    print('Resize:  ' + str(input_shape))
     if i == 500:
         lr = lr/5.
         print('reduce lr, lr=', lr, 'now')

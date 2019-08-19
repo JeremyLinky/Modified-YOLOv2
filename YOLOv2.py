@@ -4,8 +4,9 @@ from __future__ import print_function
 import tensorflow as tf
 import os
 import sys
+import gc
 import numpy as np
-
+from memory_profiler import profile
 
 class YOLOv2:
     def __init__(self, config, data_provider):
@@ -69,22 +70,27 @@ class YOLOv2:
         self._init_session()    # 构建好计算图之后最后初始化
         self._create_saver(self.path_backone, self.path_head)
 
+    @profile
     def define_inputs(self):
-        shape = [self.batch_size]
-        shape.extend(self.data_shape)       # [batch,data_shape]
-        mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)       # VOC2007像素均值
-        std = tf.convert_to_tensor([61.186, 59.753, 60.371], dtype=tf.float32)
+        self.shape = [self.batch_size]
+        self.shape.extend(self.data_shape)       # [batch,data_shape]
+        self.mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)       # VOC2007像素均值
+        self.std = tf.convert_to_tensor([61.186, 59.753, 60.371], dtype=tf.float32)
         if self.data_format == 'channels_last':
-            mean = tf.reshape(mean, [1, 1, 1, 3])   # 1*1*1*3
+            self.mean = tf.reshape(self.mean, [1, 1, 1, 3])   # 1*1*1*3
         else:
-            mean = tf.reshape(mean, [1, 3, 1, 1])   # 1*3*1*1
+            self.mean = tf.reshape(self.mean, [1, 3, 1, 1])   # 1*3*1*1
         if self.mode == 'train':
             self.images, self.ground_truth = self.train_iterator.get_next()     # 迭代获取下一组数据
-            self.images = (self.images - mean)/std    # normilazation
-            self.images.set_shape(shape)              # resize
+            self.images = (self.images - self.mean)/self.std    # normilazation
+            self.images.set_shape(self.shape)              # resize
         else:
-            self.images = tf.placeholder(tf.float32, shape, name='images')
-            self.images = (self.images - mean) / std
+            self.images = tf.placeholder(tf.float32, self.shape, name='images')
+            self.images = (self.images - self.mean) / self.std
+
+    def change_iterator(self, train_gen):
+        self.train_generator = train_gen
+        self.train_initializer, self.train_iterator = self.train_generator
 
     def _build_graph(self):
         self.grad = []
@@ -93,9 +99,9 @@ class YOLOv2:
                 with tf.variable_scope(('backone'), reuse=tf.compat.v1.AUTO_REUSE):      # get feature extractor
                     features, passthrough, downsampling_rate = self._feature_extractor(self.input_images)
                 with tf.variable_scope(('head'), reuse=tf.compat.v1.AUTO_REUSE):    # get yolov2 head
-                    conv1 = self._conv_layer(features, 1024, 3, 1, 'conv1')     #23
+                    conv1 = self._conv_layer(features, 1024, 3, 1, 'conv1')     # 23
                     lrelu1 = tf.nn.leaky_relu(conv1, 0.1, 'lrelu1')
-                    conv2 = self._conv_layer(lrelu1, 1024, 3, 1, 'conv2')       #24
+                    conv2 = self._conv_layer(lrelu1, 1024, 3, 1, 'conv2')       # 24
                     lrelu2 = tf.nn.leaky_relu(conv2, 0.1, 'lrelu2')
 
                     conv_passthrough = self._conv_layer(passthrough, 64, 1, 1, 'conv_pass')
@@ -113,7 +119,7 @@ class YOLOv2:
                     # 全卷积的输出层：final_units对应着anchor输出, 13*13*125  125=5(20+5)
 
                     if self.data_format == 'channels_first':
-                        pred = tf.transpose(pred, [0, 2, 3, 1]) # 0维：数量  2 3 1 使channel置于最后
+                        pred = tf.transpose(pred, [0, 2, 3, 1])     # 0维：数量  2 3 1 使channel置于最后
                     pshape = tf.shape(pred)     # 输出张量维度
 
                     pred = tf.reshape(pred, [pshape[0], pshape[1], pshape[2], self.num_priors, -1])
@@ -404,7 +410,7 @@ class YOLOv2:
         for i in range(num_iters):
             images = self.sess.run([self.images])
             images = np.squeeze(images)
-            _, loss = self.sess.run([self.train_op, self.loss],
+            _, loss= self.sess.run([self.train_op, self.loss],
                                     feed_dict={self.lr: lr, self.input_images: images,
                                                self.anchor_shape: int(self.data_shape[0]/32)})
             sys.stdout.write('\r>> ' + 'iters '+str(i+1)+str('/')+str(num_iters)+' loss '+str(loss))
