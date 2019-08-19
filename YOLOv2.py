@@ -53,8 +53,11 @@ class YOLOv2:
 
         self.global_step = tf.get_variable(name='global_step', initializer=tf.constant(0), trainable=False)
         self.is_training = True
-
-        self._define_inputs()
+        self.input_images = tf.placeholder(dtype=tf.float32, shape=[self.batch_size, None, None, 3],
+                                           name='input_images')
+        self.anchor_shape = tf.placeholder(dtype=tf.int64, shape=[], name='anchor_shape')
+        self.lr = tf.placeholder(dtype=tf.float32, shape=[], name='lr')  # 设置 lr 为训练时的输入
+        self.define_inputs()
 
         if self.mode == 'train':
             self._build_graph()
@@ -63,33 +66,32 @@ class YOLOv2:
 
         if self.mode == 'train':
             self._create_summary()
-        self._init_session()    #构建好计算图之后最后初始化
+        self._init_session()    # 构建好计算图之后最后初始化
         self._create_saver(self.path_backone, self.path_head)
 
-    def _define_inputs(self):
+    def define_inputs(self):
         shape = [self.batch_size]
-        shape.extend(self.data_shape)       #[batch,data_shape]
-        mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)       #VOC2007像素均值
+        shape.extend(self.data_shape)       # [batch,data_shape]
+        mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)       # VOC2007像素均值
         std = tf.convert_to_tensor([61.186, 59.753, 60.371], dtype=tf.float32)
         if self.data_format == 'channels_last':
-            mean = tf.reshape(mean, [1, 1, 1, 3])   #1*1*1*3
+            mean = tf.reshape(mean, [1, 1, 1, 3])   # 1*1*1*3
         else:
-            mean = tf.reshape(mean, [1, 3, 1, 1])   #1*3*1*1
+            mean = tf.reshape(mean, [1, 3, 1, 1])   # 1*3*1*1
         if self.mode == 'train':
-            self.images, self.ground_truth = self.train_iterator.get_next()     #迭代获取下一组数据
-            self.images = (self.images - mean)/std    #normilazation
-            self.images.set_shape(shape)  # resize
+            self.images, self.ground_truth = self.train_iterator.get_next()     # 迭代获取下一组数据
+            self.images = (self.images - mean)/std    # normilazation
+            self.images.set_shape(shape)              # resize
         else:
             self.images = tf.placeholder(tf.float32, shape, name='images')
             self.images = (self.images - mean) / std
-        self.lr = tf.compat.v1.placeholder(dtype=tf.float32, shape=[], name='lr')     #设置 lr 为训练时的输入
 
     def _build_graph(self):
         self.grad = []
         for i in range(self.num_gpu):
             with tf.device('/gpu:%d' % i):
                 with tf.variable_scope(('backone'), reuse=tf.compat.v1.AUTO_REUSE):      # get feature extractor
-                    features, passthrough, downsampling_rate = self._feature_extractor(self.images)
+                    features, passthrough, downsampling_rate = self._feature_extractor(self.input_images)
                 with tf.variable_scope(('head'), reuse=tf.compat.v1.AUTO_REUSE):    # get yolov2 head
                     conv1 = self._conv_layer(features, 1024, 3, 1, 'conv1')     #23
                     lrelu1 = tf.nn.leaky_relu(conv1, 0.1, 'lrelu1')
@@ -98,8 +100,9 @@ class YOLOv2:
 
                     conv_passthrough = self._conv_layer(passthrough, 64, 1, 1, 'conv_pass')
                     lrelu_passthrough = tf.nn.leaky_relu(conv_passthrough, 0.1, 'lrelu_pass')
-                    passthrough = tf.reshape(lrelu_passthrough, [self.batch_size, int(self.data_shape[0]/32),
-                                                                int(self.data_shape[1]/32), -1], 'passthrough')
+
+                    passthrough = tf.reshape(lrelu_passthrough, [self.batch_size, self.anchor_shape,
+                                                                 self.anchor_shape, 256], 'passthrough')
 
                     axes = 3 if self.data_format == 'channels_last' else 1
                     concatation = tf.concat([passthrough, lrelu2], axis=axes)    # output and passthrough concat
@@ -210,7 +213,7 @@ class YOLOv2:
                 self.loss = total_loss + self.weight_decay * tf.add_n(      #对于可训练变量使用L2正则化
                     [tf.nn.l2_loss(var) for var in tf.trainable_variables()]
                 )
-                with tf.variable_scope(('loss'),reuse=tf.compat.v1.AUTO_REUSE):
+                with tf.variable_scope(('loss'), reuse=tf.compat.v1.AUTO_REUSE):
                     self.optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=self.lr)
                     grads = self.optimizer.compute_gradients(loss=self.loss)
                     self.grad.append(grads)
@@ -399,13 +402,16 @@ class YOLOv2:
         mean_loss = []
         num_iters = self.num_train // (self.batch_size*self.num_gpu)
         for i in range(num_iters):
-            _, loss, summaries = self.sess.run([self.train_op, self.loss, self.summary_op],
-                                                        feed_dict={self.lr: lr})
+            images = self.sess.run([self.images])
+            images = np.squeeze(images)
+            _, loss = self.sess.run([self.train_op, self.loss],
+                                    feed_dict={self.lr: lr, self.input_images: images,
+                                               self.anchor_shape: int(self.data_shape[0]/32)})
             sys.stdout.write('\r>> ' + 'iters '+str(i+1)+str('/')+str(num_iters)+' loss '+str(loss))
             sys.stdout.flush()
             mean_loss.append(loss)
-            if writer is not None:
-                writer.add_summary(summaries, global_step=self.global_step)
+            # if writer is not None:
+            #     writer.add_summary(summaries, global_step=self.global_step)
         sys.stdout.write('\n')
         mean_loss = np.mean(mean_loss)
         return mean_loss

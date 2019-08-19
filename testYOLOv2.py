@@ -1,12 +1,13 @@
 import os
 import random
 import utils.tfrecord_voc_utils as voc_utils
+import tensorflow as tf
 import YOLOv2 as yolov2
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-lr = 0.0001
+lr = 0.0005
 batch_size = 16
 buffer_size = 1200
 epochs = 1000
@@ -14,13 +15,13 @@ data = os.listdir('./data/')
 data = [os.path.join('./data/', name) for name in data]
 
 shape = [320, 352, 384, 416, 448, 480, 512, 544, 576, 608]
-input_shape = [320, 320, 3]
-factor = float(input_shape[0]/320)
-path_backone = './yolo2/test-backone-4992'
-path_head = './yolo2/test-head-4992'
+input_shape = [608, 608, 3]
+factor = float(input_shape[0]/608)
+path_backone = './yolo2/test-backone-4524'
+path_head = './yolo2/test-head-4524'
 config = {
     'mode': 'train',                                 # 'train', 'test'
-    'is_pretraining': True,
+    'is_pretraining': False,
     'data_shape': input_shape,
     'num_classes': 20,
     'weight_decay': 5e-4,
@@ -63,38 +64,41 @@ train_gen = voc_utils.get_generator(data, batch_size, buffer_size, image_augment
 train_provider = {
     'data_shape': input_shape,
     'num_train': 5011,
-    'num_val': 256,
+    'num_val': None,
     'train_generator': train_gen,
     'val_generator': None
 }
 
 testnet = yolov2.YOLOv2(config, train_provider)
 for i in range(epochs):
-    if i % 15 == 0:
-        index = random.choice(shape)
-        input_shape = [index, index, 3]
+    if i % 10 == 0 and i != 0:
+        index = random.randint(0, 9)
+        input_shape = [shape[index], shape[index], 3]
         factor = float(input_shape[0] / 320)
         testnet.data_shape = input_shape
         print('Resize:  ' + str(input_shape))
-        testnet.priors = [[round(0.42*factor, 3), round(0.72*factor, 3)],
-                          [round(0.92*factor, 3), round(1.63*factor, 3)],
-                          [round(1.78*factor, 3), round(3.2*factor, 3)],
-                          [round(3.68*factor, 3), round(5.2*factor, 3)],
-                          [round(7.825*factor, 3), round(7.72*factor, 3)]]
-        print(testnet.priors)
+        priors = [[round(0.42*factor, 3), round(0.72*factor, 3)],
+                  [round(0.92*factor, 3), round(1.63*factor, 3)],
+                  [round(1.78*factor, 3), round(3.2*factor, 3)],
+                  [round(3.68*factor, 3), round(5.2*factor, 3)],
+                  [round(7.825*factor, 3), round(7.72*factor, 3)]]
+        priors = tf.convert_to_tensor(priors, dtype=tf.float32)
+        testnet.priors = tf.reshape(priors, [1, 1, testnet.num_priors, 2])
         image_augmentor_config['output_shape'] = [input_shape[0], input_shape[1]]
         train_gen = voc_utils.get_generator(data, batch_size, buffer_size, image_augmentor_config)
-        train_provider['data_shape'] = input_shape
-        train_provider['train_generator'] = train_gen
-        testnet.data_provider = train_provider
-
+        testnet.train_generator = train_gen
+        testnet.train_initializer, testnet.train_iterator = testnet.train_generator
+        testnet.define_inputs()
+        
     print('-'*25, 'epoch', i, '-'*25)
-    if i == 300:
+    if i == 500:
         lr = lr/5.
         print('reduce lr, lr=', lr, 'now')
-    if i == 700:
+    if i == 800:
         lr = lr/4
         print('reduce lr, lr=', lr, 'now')
+
     mean_loss = testnet.train_one_epoch(lr)
     print('>> mean loss', mean_loss)
     testnet.save_section_weight('best', './yolo2/test', mean_loss, i)  # 'latest', 'best'
+
