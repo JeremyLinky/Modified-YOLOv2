@@ -4,9 +4,10 @@ from __future__ import print_function
 import tensorflow as tf
 import os
 import sys
-import gc
+import cv2
 import numpy as np
 from memory_profiler import profile
+
 
 class YOLOv2:
     def __init__(self, config, data_provider):
@@ -54,10 +55,18 @@ class YOLOv2:
 
         self.global_step = tf.get_variable(name='global_step', initializer=tf.constant(0), trainable=False)
         self.is_training = True
-        self.input_images = tf.placeholder(dtype=tf.float32, shape=[self.batch_size, None, None, 3],
+        self.input_images = tf.placeholder(dtype=tf.float32, shape=[self.batch_size*self.num_gpu, None, None, 3],
                                            name='input_images')
+        self.ground_truth = tf.placeholder(dtype=tf.float32, shape=[self.batch_size*self.num_gpu, 60, 5], name='gt')
+        self.ground_truth_split = tf.split(self.ground_truth, self.num_gpu, axis=0)
         self.anchor_shape = tf.placeholder(dtype=tf.int64, shape=[], name='anchor_shape')
         self.lr = tf.placeholder(dtype=tf.float32, shape=[], name='lr')  # 设置 lr 为训练时的输入
+        self.mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)  # VOC2007像素均值
+        self.std = tf.convert_to_tensor([61.186, 59.753, 60.371], dtype=tf.float32)
+        if self.data_format == 'channels_last':
+            self.mean = tf.reshape(self.mean, [1, 1, 1, 3])  # 1*1*1*3
+        else:
+            self.mean = tf.reshape(self.mean, [1, 3, 1, 1])  # 1*3*1*1
         self.define_inputs()
 
         if self.mode == 'train':
@@ -65,39 +74,27 @@ class YOLOv2:
         else:
             self._test_graph()
 
-        if self.mode == 'train':
-            self._create_summary()
         self._init_session()    # 构建好计算图之后最后初始化
-        self._create_saver(self.path_backone, self.path_head)
+        self.create_saver(self.path_backone, self.path_head)
 
-    @profile
     def define_inputs(self):
-        self.shape = [self.batch_size]
-        self.shape.extend(self.data_shape)       # [batch,data_shape]
-        self.mean = tf.convert_to_tensor([114.375, 108.375, 99.96], dtype=tf.float32)       # VOC2007像素均值
-        self.std = tf.convert_to_tensor([61.186, 59.753, 60.371], dtype=tf.float32)
-        if self.data_format == 'channels_last':
-            self.mean = tf.reshape(self.mean, [1, 1, 1, 3])   # 1*1*1*3
-        else:
-            self.mean = tf.reshape(self.mean, [1, 3, 1, 1])   # 1*3*1*1
+        shape = [self.batch_size*self.num_gpu]
+        shape.extend(self.data_shape)       # [batch,data_shape]
         if self.mode == 'train':
-            self.images, self.ground_truth = self.train_iterator.get_next()     # 迭代获取下一组数据
+            self.images, self.gt = self.train_iterator.get_next()     # 迭代获取下一组数据
+            self.images.set_shape(shape)
             self.images = (self.images - self.mean)/self.std    # normilazation
-            self.images.set_shape(self.shape)              # resize
         else:
-            self.images = tf.placeholder(tf.float32, self.shape, name='images')
-            self.images = (self.images - self.mean) / self.std
-
-    def change_iterator(self, train_gen):
-        self.train_generator = train_gen
-        self.train_initializer, self.train_iterator = self.train_generator
+            self.images = tf.placeholder(tf.float32, shape, name='images')
+            self.images = (self.images - self.mean)/self.std
 
     def _build_graph(self):
         self.grad = []
-        for i in range(self.num_gpu):
-            with tf.device('/gpu:%d' % i):
+        input_images = tf.split(self.input_images, self.num_gpu, axis=0)
+        for index in range(self.num_gpu):
+            with tf.device('/gpu:%d' % index):
                 with tf.variable_scope(('backone'), reuse=tf.compat.v1.AUTO_REUSE):      # get feature extractor
-                    features, passthrough, downsampling_rate = self._feature_extractor(self.input_images)
+                    features, passthrough, downsampling_rate = self._feature_extractor(input_images[index])
                 with tf.variable_scope(('head'), reuse=tf.compat.v1.AUTO_REUSE):    # get yolov2 head
                     conv1 = self._conv_layer(features, 1024, 3, 1, 'conv1')     # 23
                     lrelu1 = tf.nn.leaky_relu(conv1, 0.1, 'lrelu1')
@@ -132,8 +129,8 @@ class YOLOv2:
                     # 13*13个cell中 5个anchor的（center hw tl br） 基于13*13
                 self.total_loss = []
                 for i in range(self.batch_size):
-                    gn_yxi, gn_hwi, gn_labeli = self._get_normlized_gn(downsampling_rate, i)    # gt的（center hw class）
-                    gn_floor_ = tf.cast(tf.floor(gn_yxi), tf.int64)                             # gt的yx向下取整 得到gt中心点所在的cell
+                    gn_yxi, gn_hwi, gn_labeli = self._get_normlized_gn(downsampling_rate, i, index)    # gt的（center hw class）
+                    gn_floor_ = tf.cast(tf.floor(gn_yxi), tf.int64)                 # gt的yx向下取整 得到gt中心点所在的cell
                     with tf.device('/cpu:0'):
                         nogn_mask = tf.sparse.SparseTensor(gn_floor_, tf.ones_like(gn_floor_[..., 0]),
                                                            dense_shape=[pshape[1], pshape[2]])
@@ -192,23 +189,23 @@ class YOLOv2:
                                                                                 [-1, self.num_priors, 2]), nogn_mask), 1)
                     pobj_nobest = tf.boolean_mask(tf.reshape(tf.nn.sigmoid(pobj[i, ...]), [-1, self.num_priors]), nogn_mask)
 
-                    num_g = tf.shape(gn_y1x1i)[0]               #gt的label个数
-                    num_p = tf.shape(abbox_y1x1_nobest)[0]      #prediction的数目
-                    gn_y1x1i = tf.tile(tf.expand_dims(gn_y1x1i, 0), [num_p, 1, 1, 1])   #g*num_p
+                    num_g = tf.shape(gn_y1x1i)[0]               # gt的label个数
+                    num_p = tf.shape(abbox_y1x1_nobest)[0]      # prediction的数目
+                    gn_y1x1i = tf.tile(tf.expand_dims(gn_y1x1i, 0), [num_p, 1, 1, 1])   # g*num_p
                     gn_y2x2i = tf.tile(tf.expand_dims(gn_y2x2i, 0), [num_p, 1, 1, 1])
 
-                    abbox_y1x1_nobest = tf.tile(abbox_y1x1_nobest, [1, num_g, 1, 1])    #p*num_g
+                    abbox_y1x1_nobest = tf.tile(abbox_y1x1_nobest, [1, num_g, 1, 1])    # p*num_g
                     abbox_y2x2_nobest = tf.tile(abbox_y2x2_nobest, [1, num_g, 1, 1])
-                    agiou_y1x1 = tf.maximum(gn_y1x1i, abbox_y1x1_nobest)        #最右下的左上角
-                    agiou_y2x2 = tf.minimum(gn_y2x2i, abbox_y2x2_nobest)        #最左上的右下角
+                    agiou_y1x1 = tf.maximum(gn_y1x1i, abbox_y1x1_nobest)        # 最右下的左上角
+                    agiou_y2x2 = tf.minimum(gn_y2x2i, abbox_y2x2_nobest)        # 最左上的右下角
 
-                    agiou_area = tf.reduce_prod(agiou_y2x2 - agiou_y1x1, axis=-1)           #交集
+                    agiou_area = tf.reduce_prod(agiou_y2x2 - agiou_y1x1, axis=-1)           # 交集
                     aarea = tf.reduce_prod(abbox_y2x2_nobest - abbox_y1x1_nobest, axis=-1)
                     garea = tf.reduce_prod(gn_y2x2i - gn_y1x1i, axis=-1)
-                    agiou = agiou_area / (aarea + garea - agiou_area)                       #iou
-                    agiou = tf.reduce_max(agiou, axis=1)                                    #取nobest'max iou
+                    agiou = agiou_area / (aarea + garea - agiou_area)                       # iou
+                    agiou = tf.reduce_max(agiou, axis=1)                                    # 取nobest'max iou
 
-                    #iou<0.5 认为检测到没有 若有物体则有误检的loss
+                    # iou<0.5 认为检测到没有 若有物体则有误检的loss
                     noobj_loss = tf.reduce_sum(tf.square(tf.zeros_like(pobj_nobest) -
                                                          pobj_nobest)*tf.cast(agiou <= self.nms_iou_threshold, tf.float32))
                     loss = self.coord_sacle * coord_loss + self.class_scale * class_loss + \
@@ -216,7 +213,7 @@ class YOLOv2:
                     self.total_loss.append(loss)
                 total_loss = tf.reduce_mean(self.total_loss)
 
-                self.loss = total_loss + self.weight_decay * tf.add_n(      #对于可训练变量使用L2正则化
+                self.loss = total_loss + self.weight_decay * tf.add_n(      # 对于可训练变量使用L2正则化
                     [tf.nn.l2_loss(var) for var in tf.trainable_variables()]
                 )
                 with tf.variable_scope(('loss'), reuse=tf.compat.v1.AUTO_REUSE):
@@ -290,52 +287,47 @@ class YOLOv2:
         self.detection_pred = [scores, bbox, class_id, pclasst]
 
     def _init_session(self):
-        self.sess = tf.InteractiveSession()
+        self.sess = tf.Session()
         self.sess.run(tf.global_variables_initializer())
         if self.mode == 'train':
             if self.train_initializer is not None:
                 self.sess.run(self.train_initializer)
 
-    def _create_saver(self, path_backone, path_head):
+    def create_saver(self, path_backone, path_head):
         weights_backone = tf.trainable_variables(scope='backone')
         weights_head = tf.trainable_variables(scope='head')
-        self.pretraining_weight_saver1 = tf.compat.v1.train.Saver(weights_backone, max_to_keep=1)
+        self.pretraining_weight_saver1 = tf.compat.v1.train.Saver(weights_backone, max_to_keep=1)   # best
         self.pretraining_weight_saver2 = tf.compat.v1.train.Saver(weights_head, max_to_keep=1)
+        self.latest_weight_saver1 = tf.compat.v1.train.Saver(weights_backone, max_to_keep=1)        # latest
+        self.latest_weight_saver2 = tf.compat.v1.train.Saver(weights_head, max_to_keep=1)
         if self.pretrain is True:
             self.pretraining_weight_saver1.restore(self.sess, path_backone)
             self.pretraining_weight_saver2.restore(self.sess, path_head)
             print('Load weight successfully!')
 
-
-    def _create_summary(self):
-        with tf.variable_scope('summaries'):
-            tf.compat.v1.summary.scalar('loss', self.loss)
-            self.summary_op = tf.compat.v1.summary.merge_all()
-
     def _get_priors(self, pshape, priors):
-        tl_y = tf.range(0., tf.cast(pshape[1], tf.float32), dtype=tf.float32)   #13
-        tl_x = tf.range(0., tf.cast(pshape[2], tf.float32), dtype=tf.float32)   #13
-        tl_y_ = tf.reshape(tl_y, [-1, 1, 1, 1])                                 #13*1*1*1
-        tl_x_ = tf.reshape(tl_x, [1, -1, 1, 1])                                 #1*13*1*1
-        tl_y_ = tf.tile(tl_y_, [1, pshape[2], 1, 1])                            #tf.tile 对相应维度进行复制 ：13*13*1*1
-        tl_x_ = tf.tile(tl_x_, [pshape[1], 1, 1, 1])                            #13*13*1*1
-        tl = tf.concat([tl_y_, tl_x_], -1)                                      #13*13*1*2
-        abbox_yx = tl + 0.5                                                     #每个格点的中心点
-        abbox_yx = tf.tile(abbox_yx, [1, 1, self.num_priors, 1])                #13*13*5*2
-        abbox_hw = priors                                                       #1*1*5*2
-        abbox_hw = tf.tile(abbox_hw, [pshape[1], pshape[2], 1, 1])              #13*13*5*2
-        abbox_y1x1 = abbox_yx - abbox_hw / 2                                    #中心点减去半个宽高
-        abbox_y2x2 = abbox_yx + abbox_hw / 2                                    #中心点加上半个宽高
-        return abbox_yx, abbox_hw, abbox_y1x1, abbox_y2x2                       #每个cell的5个anchor的中心点 宽高 左上角 右下角
+        tl_y = tf.range(0., tf.cast(pshape[1], tf.float32), dtype=tf.float32)   # 13
+        tl_x = tf.range(0., tf.cast(pshape[2], tf.float32), dtype=tf.float32)   # 13
+        tl_y_ = tf.reshape(tl_y, [-1, 1, 1, 1])                                 # 13*1*1*1
+        tl_x_ = tf.reshape(tl_x, [1, -1, 1, 1])                                 # 1*13*1*1
+        tl_y_ = tf.tile(tl_y_, [1, pshape[2], 1, 1])                            # tf.tile 对相应维度进行复制 ：13*13*1*1
+        tl_x_ = tf.tile(tl_x_, [pshape[1], 1, 1, 1])                            # 13*13*1*1
+        tl = tf.concat([tl_y_, tl_x_], -1)                                      # 13*13*1*2
+        abbox_yx = tl + 0.5                                                     # 每个格点的中心点
+        abbox_yx = tf.tile(abbox_yx, [1, 1, self.num_priors, 1])                # 13*13*5*2
+        abbox_hw = priors                                                       # 1*1*5*2
+        abbox_hw = tf.tile(abbox_hw, [pshape[1], pshape[2], 1, 1])              # 13*13*5*2
+        abbox_y1x1 = abbox_yx - abbox_hw / 2                                    # 中心点减去半个宽高
+        abbox_y2x2 = abbox_yx + abbox_hw / 2                                    # 中心点加上半个宽高
+        return abbox_yx, abbox_hw, abbox_y1x1, abbox_y2x2                       # 每个cell的5个anchor的中心点 宽高 左上角 右下角
 
-    def _get_normlized_gn(self, downsampling_rate, i):
-
-        slice_index = tf.argmin(self.ground_truth[i, ...], axis=0)[0]
-        ground_truth = tf.gather(self.ground_truth[i, ...], tf.range(0, slice_index, dtype=tf.int64))   #获取gt[i]中的0到slice_index维度
+    def _get_normlized_gn(self, downsampling_rate, i, index):
+        slice_index = tf.argmin(self.ground_truth_split[index][i, ...], axis=0)[0]    # num_of_labels per image
+        ground_truth = tf.gather(self.ground_truth_split[index][i, ...], tf.range(0, slice_index, dtype=tf.int64))   # 获取gt[i]中的0到slice_index维度
         scale = tf.constant([downsampling_rate, downsampling_rate,
-                             downsampling_rate, downsampling_rate, 1], dtype=tf.float32)    #y x h w class
+                             downsampling_rate, downsampling_rate, 1], dtype=tf.float32)    # y x h w class
         scale = tf.reshape(scale, [1, 5])
-        gn = ground_truth / scale                                                           #压缩至输出图：13*13的比例
+        gn = ground_truth / scale                                                           # 压缩至输出图：13*13的比例
         return gn[..., :2], gn[..., 2:4], tf.cast(gn[..., 4], tf.int32)
 
     def _average_gradients(self, tower_grads):
@@ -352,7 +344,7 @@ class YOLOv2:
             average_grads.append(grad_and_var)
         return average_grads
 
-    def _feature_extractor(self, image):    #image为读入的一组数据
+    def _feature_extractor(self, image):    # image为读入的一组数据
         conv1 = self._conv_layer(image, 32, 3, 1, 'conv1')
         lrelu1 = tf.nn.leaky_relu(conv1, 0.1, 'lrelu1')
         pool1 = self._max_pooling(lrelu1, 2, 2, 'pool1')
@@ -398,29 +390,72 @@ class YOLOv2:
         conv17 = self._conv_layer(lrelu16, 512, 1, 1, 'conv17')
         lrelu17 = tf.nn.leaky_relu(conv17, 0.1, 'lrelu17')
         conv18 = self._conv_layer(lrelu17, 1024, 3, 1, 'conv18')
-        lrelu18 = tf.nn.leaky_relu(conv18, 0.1, 'lrelu18')          #22
+        lrelu18 = tf.nn.leaky_relu(conv18, 0.1, 'lrelu18')          # 22
         downsampling_rate = 32.0
-        return lrelu18, lrelu13, downsampling_rate      #lrelu13 :26*26*512 resize 13*13*2048 as passthrough
+        return lrelu18, lrelu13, downsampling_rate      # lrelu13 :26*26*512 resize 13*13*2048 as passthrough
 
-    def train_one_epoch(self, lr, writer=None):
+    def train_one_epoch(self, lr, num):
         self.is_training = True
         self.sess.run(self.train_initializer)
         mean_loss = []
         num_iters = self.num_train // (self.batch_size*self.num_gpu)
-        for i in range(num_iters):
-            images = self.sess.run([self.images])
-            images = np.squeeze(images)
-            _, loss= self.sess.run([self.train_op, self.loss],
-                                    feed_dict={self.lr: lr, self.input_images: images,
+        for index in range(num_iters):
+            handle = self.sess.partial_run_setup([self.images, self.gt])
+            images, gt = self.sess.partial_run(handle, [self.images, self.gt])
+            '''
+            for i in range(self.batch_size * self.num_gpu):
+                img = np.array(images[i])
+                img = cv2.split(img)
+                img_channel = []
+                for j in range(3):
+                    img_channel.append(img[j])
+                img_channel[0], img_channel[2] = img_channel[2], img_channel[0]
+                image = cv2.merge(img_channel)
+                cv2.imwrite('./testimg/' + str(num) + '_' + str(index) + '_' + str(i) + '.jpg', image)
+
+            for i in range(self.batch_size * self.num_gpu):
+                for j in range(60):
+                    if gt[i][j][0] == -1:
+                        process_gt = gt[i][:j]
+                        np.savetxt('./testimg/' + str(num) + '_' + str(index) + '_' + str(i) + '.txt', process_gt)
+                        break
+            '''
+            _, loss = self.sess.run([self.train_op, self.loss],
+                                    feed_dict={self.lr: lr, self.input_images: images, self.ground_truth: gt,
                                                self.anchor_shape: int(self.data_shape[0]/32)})
-            sys.stdout.write('\r>> ' + 'iters '+str(i+1)+str('/')+str(num_iters)+' loss '+str(loss))
+            sys.stdout.write('\r>> ' + 'iters '+str(index+1)+str('/')+str(num_iters)+' loss '+str(loss))
             sys.stdout.flush()
             mean_loss.append(loss)
-            # if writer is not None:
-            #     writer.add_summary(summaries, global_step=self.global_step)
         sys.stdout.write('\n')
         mean_loss = np.mean(mean_loss)
         return mean_loss
+
+    def test_input(self):
+        self.is_training = True
+        self.sess.run(self.train_initializer)
+        handle = self.sess.partial_run_setup([self.images, self.gt])
+        images, ground_truth = self.sess.partial_run(handle, [self.images, self.gt])
+
+        images = np.squeeze(images)
+        for i in range(self.batch_size*self.num_gpu):
+            img = np.array(images[i])
+            img = cv2.split(img)
+            img_channel = []
+            for j in range(3):
+                img_channel.append(img[j])
+            img_channel[0], img_channel[2] = img_channel[2], img_channel[0]
+            image = cv2.merge(img_channel)
+            cv2.imwrite('./testimg/'+str(i)+'.jpg', image)
+        print(ground_truth)
+        ground_truth = np.squeeze(ground_truth)
+        ground_truth = np.concatenate([ground_truth[0], ground_truth[1]], axis=0)
+        for i in range(self.batch_size*self.num_gpu):
+            for j in range(60):
+                if ground_truth[i][j][0] == -1:
+                    process_gt = ground_truth[i][:j]
+                    print(process_gt)
+                    np.savetxt('./testimg/'+str(i)+'.txt', process_gt)
+                    break
 
     def test_one_image(self, images):
         self.is_training = False
@@ -434,8 +469,8 @@ class YOLOv2:
             print(os.path.dirname(path), 'does not exist, create it done')
 
         if mode == 'latest':
-            self.pretraining_weight_saver1.save(self.sess, path + '-backone', global_step=self.global_step)
-            self.pretraining_weight_saver2.save(self.sess, path + '-head', global_step=self.global_step)
+            self.latest_weight_saver1.save(self.sess, path + '-backone', global_step=self.global_step)
+            self.latest_weight_saver2.save(self.sess, path + '-head', global_step=self.global_step)
             print('>> save', mode, 'model in', path, 'successfully')
         else:
             if i == 0:
@@ -451,7 +486,7 @@ class YOLOv2:
                 else:
                     pass
 
-    def count_para(self):
+    def _count_para(self):
         from functools import reduce
         from operator import mul
         num_params = 0

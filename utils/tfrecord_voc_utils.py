@@ -11,6 +11,7 @@ import sys
 from utils.voc_classname_encoder import classname_to_ids
 from utils.image_augmentor import image_augmentor
 
+
 def int64_feature(values):
     if not isinstance(values, (tuple, list)):
         values = [values]
@@ -91,38 +92,37 @@ def dataset2tfrecord(xml_dir, img_dir, output_dir, name, total_shards=5):
     return outputfiles
 
 
-class Dataset:
-    def parse_function(self, data, config):
-            features = tf.io.parse_single_example(data, features={     # 产生一个实例
-                'image': tf.io.FixedLenFeature([], tf.string),
-                'shape': tf.io.FixedLenFeature([], tf.string),
-                'ground_truth': tf.io.FixedLenFeature([], tf.string)
-            })
-            shape = tf.decode_raw(features['shape'], tf.int32)      # tf.decode_raw:主要用于将原来编码为字符串的类型变回来
-            ground_truth = tf.decode_raw(features['ground_truth'], tf.float32)
-            shape = tf.reshape(shape, [3])
-            ground_truth = tf.reshape(ground_truth, [-1, 5])    # 这个框的标注对应于5个内容
-            images = tf.image.decode_jpeg(features['image'], channels=3)    # channel=3为RGB图片
-            images = tf.cast(tf.reshape(images, shape), tf.float32)
-            images, ground_truth = image_augmentor(image=images,
-                                                   input_shape=shape,
-                                                   ground_truth=ground_truth,
-                                                   **config
-                                                   )
-            return images, ground_truth
+def parse_function(data, config):
+        features = tf.io.parse_single_example(data, features={     # 产生一个实例
+            'image': tf.io.FixedLenFeature([], tf.string),
+            'shape': tf.io.FixedLenFeature([], tf.string),
+            'ground_truth': tf.io.FixedLenFeature([], tf.string)
+        })
+        shape = tf.decode_raw(features['shape'], tf.int32)      # tf.decode_raw:主要用于将原来编码为字符串的类型变回来
+        ground_truth = tf.decode_raw(features['ground_truth'], tf.float32)
+        shape = tf.reshape(shape, [3])
+        ground_truth = tf.reshape(ground_truth, [-1, 5])    # 这个框的标注对应于5个内容
+        images = tf.image.decode_jpeg(features['image'], channels=3)    # channel=3为RGB图片
+        images = tf.cast(tf.reshape(images, shape), tf.float32)
+        images, ground_truth = image_augmentor(image=images,
+                                               input_shape=shape,
+                                               ground_truth=ground_truth,
+                                               **config
+                                               )
+        return images, ground_truth
 
-    def get_generator(self, tfrecords, batch_size, buffer_size, image_preprocess_config):     # image_preprocess_config:数据增强的config
-        self.data = tf.data.TFRecordDataset(tfrecords)       # 读取tfrecord格式的数据集
-        # data1 = data.map(lambda x: parse_function(x, image_preprocess_config))
 
-        self.data = self.data.map(lambda x: self.parse_function(x, image_preprocess_config)).shuffle(buffer_size=buffer_size).batch(batch_size, drop_remainder=True).repeat()
+def get_generator(tfrecords, batch_size, buffer_size, image_preprocess_config):     # image_preprocess_config:数据增强的config
+    data_tfrecord = tf.data.TFRecordDataset(tfrecords)       # 读取tfrecord格式的数据集
+    data = data_tfrecord.map(lambda x: parse_function(x, image_preprocess_config)).shuffle(buffer_size=buffer_size).\
+        batch(batch_size, drop_remainder=True).repeat()
 
-        self.iterator = tf.compat.v1.data.Iterator.from_structure(tf.compat.v1.data.get_output_types(self.data),
-                                                                  tf.compat.v1.data.get_output_shapes(self.data))
-        # This iterator-constructing method can be used to create an iterator that
-        # is reusable with many different datasets
+    iterator = tf.compat.v1.data.Iterator.from_structure(tf.compat.v1.data.get_output_types(data),
+                                                              tf.compat.v1.data.get_output_shapes(data))
+    # This iterator-constructing method can be used to create an iterator that
+    # is reusable with many different datasets
 
-        self.init_op = self.iterator.make_initializer(self.data)
-        # A `tf.Operation` that can be run to initialize this iterator on the given `dataset`
-        return self.init_op, self.iterator
+    init_op = iterator.make_initializer(data)
+    # A `tf.Operation` that can be run to initialize this iterator on the given `dataset`
+    return init_op, iterator
 
